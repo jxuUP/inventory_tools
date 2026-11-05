@@ -9,6 +9,7 @@ from erpnext import get_default_cost_center
 from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
 	make_inter_company_purchase_invoice,
 )
+from erpnext.accounts.doctype.pricing_rule.utils import get_applied_pricing_rules
 from erpnext.accounts.party import get_party_account
 from erpnext.buying.doctype.purchase_order.purchase_order import (
 	PurchaseOrder,
@@ -23,8 +24,16 @@ from erpnext.stock.doctype.item.item import get_uom_conv_factor
 from erpnext.stock.utils import validate_disabled_warehouse, validate_warehouse_company
 from frappe import _, throw
 from frappe.contacts.doctype.address.address import get_company_address
-from frappe.utils import cint, flt
 from frappe.model.document import Document
+from frappe.utils import cint, flt
+
+from inventory_tools.inventory_tools.generic_items import (
+	generic_items_enabled,
+	get_generic_material_request_items,
+	get_replaced_generic_rows,
+	resolve_generic_material_request_items,
+	validate_generic_purchase_order_rows,
+)
 
 
 def skip_bound_method(*args, **kwargs):
@@ -179,11 +188,15 @@ def build_purchase_invoice_for_company(po_name, company, po_item_names):
 class InventoryToolsPurchaseOrder(PurchaseOrder):
 	def validate_with_previous_doc(self):
 		"""
-		HASH: 8f811728d97293744bb35f6a3bdba889708127c5
+		HASH: e5cde8c4b9e3f7f567a92ca3e65fd411402b89ce
 		REPO: https://github.com/frappe/erpnext/
 		PATH: erpnext/buying/doctype/purchase_order/purchase_order.py
 		METHOD: validate_with_previous_doc
 		"""
+
+		mri_compare_fields = [["project", "="], ["item_code", "="]]
+		if self.is_subcontracted:
+			mri_compare_fields = [["project", "="]]
 
 		config = {
 			"Supplier Quotation": {
@@ -206,13 +219,38 @@ class InventoryToolsPurchaseOrder(PurchaseOrder):
 			},
 			"Material Request Item": {
 				"ref_dn_field": "material_request_item",
-				"compare_fields": [["project", "="], ["item_code", "="]],
+				"compare_fields": mri_compare_fields,
 				"is_child_table": True,
 			},
 		}
 		if self.multi_company_purchase_order:
 			config.pop("Material Request")
-		super(PurchaseOrder, self).validate_with_previous_doc(config)
+
+		cleared_rows = []
+		if generic_items_enabled(self.company):
+			mr_item_names = {row.material_request_item for row in self.get("items") or []}
+			generic_mr_items = get_generic_material_request_items(mr_item_names)
+			if generic_mr_items:
+				validate_generic_purchase_order_rows(self, generic_mr_items)
+				for row in get_replaced_generic_rows(self, generic_mr_items):
+					cleared_rows.append((row, row.material_request_item))
+					row.material_request_item = None
+
+		try:
+			super(PurchaseOrder, self).validate_with_previous_doc(config)
+		finally:
+			for row, material_request_item in cleared_rows:
+				row.material_request_item = material_request_item
+
+		if cint(frappe.db.get_single_value("Buying Settings", "maintain_same_rate")):
+			self.validate_rate_with_reference_doc(
+				[["Supplier Quotation", "supplier_quotation", "supplier_quotation_item"]]
+			)
+
+	def update_prevdoc_status(self):
+		if self.docstatus == 1:
+			resolve_generic_material_request_items(self)
+		super().update_prevdoc_status()
 
 	def validate_warehouse(self):
 		warehouses = list({d.warehouse for d in self.get("items") if getattr(d, "warehouse", None)})
@@ -292,6 +330,7 @@ class InventoryToolsPurchaseOrder(PurchaseOrder):
 				parent_dict.update({"customer": parent_dict.get("party_name")})
 
 			self.pricing_rules = []
+			removed_pricing_rules = set()
 
 			for item in self.get("items"):
 				if item.get("item_code"):
@@ -320,6 +359,11 @@ class InventoryToolsPurchaseOrder(PurchaseOrder):
 						args, self, for_validate=for_validate, overwrite_warehouse=False
 					)
 					# CUSTOM CODE END
+					if ret.get("pricing_rule_removed"):
+						removed_pricing_rules.update(
+							set(get_applied_pricing_rules(args.get("pricing_rules")))
+							- set(get_applied_pricing_rules(ret.get("pricing_rules")))
+						)
 					for fieldname, value in ret.items():
 						if item.meta.get_field(fieldname) and value is not None:
 							if (
@@ -348,6 +392,7 @@ class InventoryToolsPurchaseOrder(PurchaseOrder):
 								and value is not None
 								and fieldname
 								in [
+									"price_list_rate",
 									"discount_percentage",
 									"discount_amount",
 									"rate",
@@ -389,6 +434,19 @@ class InventoryToolsPurchaseOrder(PurchaseOrder):
 						or item.get("conversion_factor")
 						or 1
 					)
+
+			if removed_pricing_rules:
+				# Keep free items when the same rule still applies to another row.
+				removed_pricing_rules.difference_update(row.pricing_rule for row in self.pricing_rules)
+				for item in self.items[:]:
+					if (
+						item.get("is_free_item")
+						and item.get("pricing_rules") in removed_pricing_rules
+						and not frappe.get_cached_value(
+							"Pricing Rule", item.pricing_rules, "dont_enforce_free_item_qty"
+						)
+					):
+						self.remove(item)
 
 			if self.doctype == "Purchase Invoice":
 				self.set_expense_account(for_validate)
